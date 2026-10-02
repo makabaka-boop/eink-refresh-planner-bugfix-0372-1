@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>离线电子纸刷新规划 · 48×48 / 3×3 瓦片</title>
+<style>
+  :root {
+    --ink: #1a1a1a;
+    --paper: #f4f1ea;
+    --panel: #ffffff;
+    --line: #d8d2c4;
+    --accent: #2f5d50;
+    --accent-soft: #e3ede9;
+    --warn: #8a3b2e;
+    --warn-soft: #f6e3de;
+    --muted: #6b675e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.5;
+  }
+  header {
+    padding: 14px 22px;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 19px; margin: 0; }
+  header .rules { font-size: 12.5px; color: var(--muted); }
+  main {
+    padding: 18px 22px 60px;
+    max-width: 1180px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 430px 1fr;
+    gap: 20px;
+    align-items: start;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .panel h2 {
+    font-size: 14px;
+    margin: 0 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--line);
+  }
+  button {
+    font: inherit;
+    font-size: 13px;
+    border: 1px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+    border-radius: 5px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #eae5d8; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover:not(:disabled) { background: #244a40; }
+  button.tool.active { background: var(--ink); color: #fff; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+  /* 编辑器 */
+  #editor-wrap { display: flex; gap: 16px; align-items: flex-start; }
+  #editor-canvas {
+    width: 288px; height: 288px;
+    image-rendering: pixelated;
+    border: 2px solid var(--ink);
+    background: #fff;
+    cursor: crosshair;
+    touch-action: none;
+    display: block;
+  }
+  #editor-side { flex: 1; min-width: 0; }
+  #editor-side .row { margin-bottom: 8px; }
+  .frame-label { font-size: 12.5px; color: var(--muted); }
+  #frames-strip {
+    display: flex; gap: 6px; overflow-x: auto; padding-bottom: 6px;
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+    background: #fbfaf6;
+  }
+  .thumb {
+    position: relative; flex: 0 0 auto; width: 58px;
+    border: 2px solid transparent; border-radius: 4px; padding: 2px;
+    background: #fff; cursor: pointer; text-align: center;
+  }
+  .thumb canvas { width: 48px; height: 48px; image-rendering: pixelated; display: block; margin: 0 auto; }
+  .thumb .idx { font-size: 11px; color: var(--muted); }
+  .thumb.active { border-color: var(--accent); background: var(--accent-soft); }
+  .thumb .del {
+    position: absolute; top: -6px; right: -6px;
+    width: 17px; height: 17px; line-height: 15px;
+    border-radius: 50%; background: var(--warn); color: #fff;
+    font-size: 11px; padding: 0; display: none;
+  }
+  .thumb:hover .del { display: block; }
+
+  #solve-status {
+    margin-top: 10px; font-size: 13px; min-height: 20px;
+  }
+  #solve-status.busy { color: var(--accent); }
+  #solve-status.error { color: var(--warn); }
+  #solve-status.stale-warn { color: #9a6a16; }
+
+  /* 结果表 */
+  table.plan { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.plan th, table.plan td {
+    border-bottom: 1px solid var(--line);
+    padding: 5px 7px; text-align: center;
+  }
+  table.plan th { background: #f6f3ec; font-weight: 600; position: sticky; top: 0; }
+  table.plan tr.step-row { cursor: pointer; }
+  table.plan tr.step-row:hover { background: #f0ece1; }
+  table.plan tr.step-row.playing { background: var(--accent-soft); }
+  .badge {
+    display: inline-block; min-width: 34px; padding: 1px 8px;
+    border-radius: 10px; font-size: 12px; font-weight: 600;
+  }
+  .badge.F { background: #e7e2d4; }
+  .badge.P { background: var(--accent-soft); color: var(--accent); }
+  .mini {
+    display: grid; grid-template-columns: repeat(3, 12px);
+    grid-template-rows: repeat(3, 12px); gap: 1px;
+    justify-content: center; margin: 0 auto;
+  }
+  .mini i {
+    width: 12px; height: 12px; display: block;
+    background: #fff; border: 1px solid #cfc9ba; font-style: normal;
+    font-size: 9px; line-height: 11px; text-align: center; color: var(--muted);
+  }
+  .mini i.dark { background: var(--ink); }
+  .mini i.b2 { background: #f1c9c1; border-color: var(--warn); color: var(--warn); font-weight: 700; }
+  .mini i.b1 { background: #f3e7c7; }
+
+  .summary { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; margin-bottom: 8px; }
+  .summary b { font-size: 15px; }
+
+  /* 播放器 */
+  #playback { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  #display-canvas {
+    width: 240px; height: 240px; image-rendering: pixelated;
+    border: 2px solid var(--ink); background: #fff; display: block;
+  }
+  #play-info { flex: 1; min-width: 220px; }
+  #play-step-text { font-size: 13.5px; margin: 6px 0 10px; min-height: 40px; }
+  .count-grid {
+    display: grid; grid-template-columns: repeat(3, 42px);
+    grid-template-rows: repeat(3, 42px); gap: 4px; margin-top: 8px;
+  }
+  .count-grid div {
+    border: 1px solid var(--line); border-radius: 4px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-size: 16px; font-weight: 600; background: #fff;
+  }
+  .count-grid div span { font-size: 10px; font-weight: 400; color: var(--muted); }
+  .count-grid div.g1 { background: #f7efda; }
+  .count-grid div.g2 { background: #f3d6cf; border-color: var(--warn); color: var(--warn); }
+  .count-title { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+  #plan-table-wrap { max-height: 340px; overflow-y: auto; margin-top: 6px; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>离线电子纸刷新规划</h1>
+  <span class="rules">
+    48×48 黑白像素 · 3×3 固定瓦片（每瓦 16×16）· 至多 20 帧 ·
+    全刷 600（全部计数清零）· 局刷每瓦 30＋改变像素数（该瓦计数 +1）· 计数上限 2 ·
+    整段序列 DP：总费用最小 → 全刷次数少 → 逐帧全刷先于局刷
+  </span>
+</header>
+
+<main>
+  <!-- 左列：编辑 -->
+  <section class="panel" id="editor-panel">
+    <h2>① 编辑目标帧序列</h2>
+    <div id="editor-wrap">
+      <canvas id="editor-canvas" width="48" height="48"></canvas>
+      <div id="editor-side">
+        <div class="row toolbar">
+          <button id="tool-pencil" class="tool active" type="button">画笔（黑）</button>
+          <button id="tool-eraser" class="tool" type="button">橡皮（白）</button>
+        </div>
+        <div class="row">
+          <button id="frame-clear" type="button">清空本帧</button>
+          <button id="frame-invert" type="button">反相</button>
+        </div>
+        <div class="frame-label" id="frame-label"></div>
+        <div class="row">
+          <label for="frame-mode">本帧刷新方式</label>
+          <select id="frame-mode">
+            <option value="either">自动选择</option>
+            <option value="F">必须全刷</option>
+            <option value="P">必须局刷</option>
+          </select>
+        </div>
+        <div class="row">
+          <label>本帧全刷费用 <input id="frame-full-cost" type="number" min="0" step="1" value="600"></label>
+          <label>局刷每瓦基础费用 <input id="frame-partial-base" type="number" min="0" step="1" value="30"></label>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px" class="toolbar">
+      <button id="frame-add" type="button">＋ 新增帧（复制当前）</button>
+      <button id="frame-dup" type="button">复制本帧</button>
+      <span class="muted" id="frame-count"></span>
+    </div>
+    <div id="frames-strip" style="margin-top:8px"></div>
+
+    <div style="margin-top:14px" class="toolbar">
+      <button id="solve-btn" class="primary" type="button">② Worker 整段求解</button>
+      <button id="export-btn" type="button" disabled>导出结果 JSON</button>
+      <button id="import-btn" type="button">导入帧 JSON</button>
+      <input type="file" id="import-file" accept="application/json,.json">
+    </div>
+    <div id="solve-status"></div>
+  </section>
+
+  <!-- 右列：结果 + 播放 -->
+  <div>
+    <section class="panel" id="result-panel">
+      <h2>③ 整段最优方案（逐帧画面 · 瓦片计数 · 费用）</h2>
+      <div id="result-empty" class="muted">尚未求解。编辑帧序列后点击“Worker 整段求解”。</div>
+      <div id="result-body" hidden>
+        <div class="summary" id="plan-summary"></div>
+        <div id="stale-banner" hidden class="muted"
+             style="background:var(--warn-soft);color:var(--warn);border:1px solid var(--warn);
+                    border-radius:5px;padding:5px 10px;margin:6px 0;font-size:12.5px">
+          ⚠ 以下方案与播放基于【修改前】的帧，仅供查看；导出已锁定，重新求解后恢复。
+        </div>
+        <div id="plan-table-wrap">
+          <table class="plan">
+            <thead>
+              <tr>
+                <th>帧</th><th>目标画面</th><th>动作</th><th>费用</th>
+                <th>变化瓦片<br>(像素)</th><th>动作前计数</th><th>动作后计数</th>
+              </tr>
+            </thead>
+            <tbody id="plan-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="playback-panel" style="margin-top:18px">
+      <h2>④ 播放（与导出共用同一求解结果）</h2>
+      <div id="playback-disabled" class="muted">求解后可播放。</div>
+      <div id="playback" hidden>
+        <div>
+          <canvas id="display-canvas" width="48" height="48"></canvas>
+          <div class="muted" id="display-caption" style="text-align:center;margin-top:4px"></div>
+        </div>
+        <div id="play-info">
+          <div class="toolbar">
+            <button id="play-first" type="button">⏮ 初始</button>
+            <button id="play-prev" type="button">◀ 上一步</button>
+            <button id="play-auto" class="primary" type="button">▶ 自动播放</button>
+            <button id="play-next" type="button">下一步 ▶</button>
+          </div>
+          <div id="play-step-text"></div>
+          <div class="count-title">各瓦片残影计数（0..2，红色为已达上限）</div>
+          <div class="count-grid" id="count-grid"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script src="js/planner-core.js"></script>
+<script>
+(function () {
+  'use strict';
+  var P = window.EPaperPlanner;
+
+  // ---------- 常量 ----------
+  var W = 48, H = 48, ROWS = 3, COLS = 3, T = 9, MAX_FRAMES = 20;
+  var SCALE = 6; // 编辑画布：48*6=288
+
+  // ---------- 编辑状态 ----------
+  var frames = [new Uint8Array(W * H)]; // 初始一帧全白
+  var frameModes = ['either'];
+  var frameFullCosts = [600];
+  var framePartialBases = [30];
+  var currentFrame = 0;
+  var brush = 1;          // 1 黑 / 0 白
+  var painting = false;
+  var dirty = true;       // 帧相对当前方案是否已改动
+
+  // ---------- 求解结果（导出与播放共用这一个对象） ----------
+  var session = null;     // { plan, frames(快照), dirty }
+
+  // ---------- DOM ----------
+  function $(id) { return document.getElementById(id); }
+  var editorCanvas = $('editor-canvas'), ectx = editorCanvas.getContext('2d');
+  var displayCanvas = $('display-canvas'), dctx = displayCanvas.getContext('2d');
+  var stripEl = $('frames-strip');
+  var statusEl = $('solve-status');
+
+  // ---------- Worker（Blob URL，完全离线）；不支持时同步兜底 ----------
+  var supervisor = null;
+  function makeBrowserTransport(onMsg, onError) {
+    if (typeof Worker === 'function' && typeof Blob === 'function') {
+      var url = URL.createObjectURL(new Blob([P.buildWorkerSource()], { type: 'application/javascript' }));
+      var w = new Worker(url);
+      w.onmessage = onMsg;
+      w.onerror = function (ev) { onError(ev); };
+      return {
+        post: function (msg) { w.postMessage(msg); },
+        terminate: function () { try { w.terminate(); } catch (e) {} URL.revokeObjectURL(url); }
+      };
+    }
+    // 兜底：主线程同步执行同一份求解逻辑
+    return {
+      post: function (msg) {
+        setTimeout(function () {
+          try {
+            var opts = msg.options || {};
+            var tr = msg.transitions || (msg.frames ? P.transitionsForGrid(msg.frames, opts) : []);
+            onMsg({ data: { id: msg.id, type: 'result', plan: P.solvePlan(tr, opts) } });
+          } catch (e) {
+            onMsg({ data: { id: msg.id, type: 'error', message: e.message } });
+          }
+        }, 0);
+      },
+      terminate: function () {}
+    };
+  }
+  supervisor = P.createSupervisor(makeBrowserTransport);
+
+  // ---------- 画布绘制 ----------
+  function drawEditor() {
+    var data = frames[currentFrame];
+    var img = ectx.createImageData(W, H);
+    for (var i = 0; i < W * H; i++) {
+      var v = data[i] ? 0 : 255;
+      img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+    }
+    ectx.putImageData(img, 0, 0);
+    // 3×3 瓦片分界线（CSS 放大后仍锐利）
+    ectx.save();
+    ectx.scale(1, 1);
+    ectx.strokeStyle = '#c0392b';
+    ectx.lineWidth = 0.5;
+    for (var gx = 1; gx < COLS; gx++) {
+      var x = gx * (W / COLS) - 0.25;
+      ectx.beginPath(); ectx.moveTo(x, 0); ectx.lineTo(x, H); ectx.stroke();
+    }
+    for (var gy = 1; gy < ROWS; gy++) {
+      var y = gy * (H / ROWS) - 0.25;
+      ectx.beginPath(); ectx.moveTo(0, y); ectx.lineTo(W, y); ectx.stroke();
+    }
+    ectx.restore();
+  }
+
+  function renderFrameToCanvas(ctx, data, w, h) {
+    var img = ctx.createImageData(w, h);
+    for (var i = 0; i < w * h; i++) {
+      var v = data[i] ? 0 : 255;
+      img.data[i * 4] = v; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  }
+
+  function makeThumbCanvas(data) {
+    var c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    renderFrameToCanvas(c.getContext('2d'), data, W, H);
+    return c;
+  }
+
+  // ---------- 帧管理 ----------
+  function renderStrip() {
+    stripEl.innerHTML = '';
+    frames.forEach(function (data, idx) {
+      var div = document.createElement('div');
+      div.className = 'thumb' + (idx === currentFrame ? ' active' : '');
+      var c = makeThumbCanvas(data);
+      div.appendChild(c);
+      var label = document.createElement('div');
+      label.className = 'idx';
+      label.textContent = '#' + (idx + 1);
+      div.appendChild(label);
+      if (frames.length > 1) {
+        var del = document.createElement('button');
+        del.className = 'del'; del.type = 'button'; del.textContent = '×';
+        del.title = '删除该帧';
+        del.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          frames.splice(idx, 1);
+          frameModes.splice(idx, 1);
+          frameFullCosts.splice(idx, 1);
+          framePartialBases.splice(idx, 1);
+          if (currentFrame >= frames.length) currentFrame = frames.length - 1;
+          markDirty(); renderAll();
+        });
+        div.appendChild(del);
+      }
+      div.addEventListener('click', function () { currentFrame = idx; renderAll(); });
+      stripEl.appendChild(div);
+    });
+    $('frame-count').textContent = '共 ' + frames.length + ' / ' + MAX_FRAMES + ' 帧';
+    $('frame-label').textContent = '正在编辑：第 ' + (currentFrame + 1) + ' 帧（红线为 3×3 瓦片边界，按下拖动可连续绘制）';
+    $('frame-add').disabled = frames.length >= MAX_FRAMES;
+    $('frame-dup').disabled = frames.length >= MAX_FRAMES;
+  }
+
+  function renderAll() {
+    drawEditor();
+    renderStrip();
+    $('frame-mode').value = frameModes[currentFrame] || 'either';
+    $('frame-full-cost').value = String(frameFullCosts[currentFrame]);
+    $('frame-partial-base').value = String(framePartialBases[currentFrame]);
+  }
+
+  function markDirty() {
+    dirty = true;
+    if (session) session.dirty = true;
+    refreshDirtyUI();
+  }
+  function refreshDirtyUI() {
+    var exportBtn = $('export-btn');
+    exportBtn.disabled = !(session && session.plan && !session.dirty);
+    var staleBanner = $('stale-banner');
+    if (session && session.dirty) {
+      statusEl.className = 'stale-warn';
+      statusEl.textContent = '⚠ 帧已修改：下方方案是旧结果，导出已禁用，请重新求解。';
+      staleBanner.hidden = false;
+    } else {
+      staleBanner.hidden = true;
+    }
+  }
+
+  // ---------- 编辑器交互 ----------
+  function eventPixel(ev) {
+    var rect = editorCanvas.getBoundingClientRect();
+    var x = Math.floor((ev.clientX - rect.left) * W / rect.width);
+    var y = Math.floor((ev.clientY - rect.top) * H / rect.height);
+    if (x < 0 || y < 0 || x >= W || y >= H) return null;
+    return { x: x, y: y };
+  }
+  function paintAt(px) {
+    if (!px) return;
+    var idx = px.y * W + px.x;
+    if (frames[currentFrame][idx] !== brush) {
+      frames[currentFrame][idx] = brush;
+      markDirty();
+      drawEditor();
+      // 更新缩略图
+      var thumb = stripEl.children[currentFrame];
+      if (thumb) renderFrameToCanvas(thumb.querySelector('canvas').getContext('2d'), frames[currentFrame], W, H);
+    }
+  }
+  editorCanvas.addEventListener('pointerdown', function (ev) {
+    ev.preventDefault();
+    editorCanvas.setPointerCapture(ev.pointerId);
+    painting = true;
+    paintAt(eventPixel(ev));
+  });
+  editorCanvas.addEventListener('pointermove', function (ev) {
+    if (painting) paintAt(eventPixel(ev));
+  });
+  window.addEventListener('pointerup', function () { painting = false; });
+
+  $('tool-pencil').addEventListener('click', function () {
+    brush = 1;
+    $('tool-pencil').classList.add('active');
+    $('tool-eraser').classList.remove('active');
+  });
+  $('tool-eraser').addEventListener('click', function () {
+    brush = 0;
+    $('tool-eraser').classList.add('active');
+    $('tool-pencil').classList.remove('active');
+  });
+  $('frame-clear').addEventListener('click', function () {
+    frames[currentFrame].fill(0); markDirty(); renderAll();
+  });
+  $('frame-invert').addEventListener('click', function () {
+    var d = frames[currentFrame];
+    for (var i = 0; i < d.length; i++) d[i] = d[i] ? 0 : 1;
+    markDirty(); renderAll();
+  });
+  $('frame-add').addEventListener('click', function () {
+    if (frames.length >= MAX_FRAMES) return;
+    frames.push(new Uint8Array(frames[currentFrame]));
+    frameModes.push('either');
+    frameFullCosts.push(600);
+    framePartialBases.push(30);
+    currentFrame = frames.length - 1;
+    markDirty(); renderAll();
+  });
+  $('frame-dup').addEventListener('click', function () {
+    if (frames.length >= MAX_FRAMES) return;
+    frames.splice(currentFrame + 1, 0, new Uint8Array(frames[currentFrame]));
+    frameModes.splice(currentFrame + 1, 0, frameModes[currentFrame]);
+    frameFullCosts.splice(currentFrame + 1, 0, frameFullCosts[currentFrame]);
+    framePartialBases.splice(currentFrame + 1, 0, framePartialBases[currentFrame]);
+    currentFrame++;
+    markDirty(); renderAll();
+  });
+
+  $('frame-mode').addEventListener('change', function (ev) {
+    frameModes[currentFrame] = ev.target.value;
+    markDirty();
+  });
+  $('frame-full-cost').addEventListener('input', function (ev) {
+    frameFullCosts[currentFrame] = Number(ev.target.value);
+    markDirty();
+  });
+  $('frame-partial-base').addEventListener('input', function (ev) {
+    framePartialBases[currentFrame] = Number(ev.target.value);
+    markDirty();
+  });
+
+  // ---------- 求解 ----------
+  function setStatus(cls, text) {
+    statusEl.className = cls || '';
+    statusEl.textContent = text || '';
+  }
+
+  function runSolve() {
+    var payloadFrames = frames.map(function (f) { return new Uint8Array(f); });
+    $('solve-btn').disabled = true;
+    setStatus('busy', 'Worker 正在整段帧序列上求解…');
+    supervisor.solve({
+      frames: payloadFrames,
+      options: { rows: ROWS, cols: COLS, width: W, height: H, fullCost: 600, partialBase: 30, maxGhost: 2,
+        frameModes: frameModes.slice(), frameFullCosts: frameFullCosts.slice(),
+        framePartialBases: framePartialBases.slice() }
+    }).then(function (plan) {
+      session = { plan: plan, frames: payloadFrames, dirty: false };
+      dirty = false;
+      setStatus('', '✓ 求解完成：总费用 ' + plan.totalCost +
+        '（全刷 ' + plan.fullRefreshCount + ' 次，局刷 ' + plan.partialRefreshCount + ' 次）。');
+      renderResult();
+      initPlayback();
+      refreshDirtyUI();
+    }).catch(function (err) {
+      if (err && err.code === 'SUPERSEDED') {
+        setStatus('busy', '旧请求已被新的求解请求取代…');
+      } else if (err && err.code === 'TERMINATED') {
+        setStatus('error', '求解器已终止。');
+      } else {
+        setStatus('error', '求解失败：' + (err && err.message ? err.message : err));
+      }
+    }).then(function () {
+      $('solve-btn').disabled = false;
+    });
+  }
+  $('solve-btn').addEventListener('click', runSolve);
+
+  // ---------- 结果表 ----------
+  function tileName(t) { return '(' + (Math.floor(t / COLS) + 1) + ',' + (t % COLS + 1) + ')'; }
+
+  function miniTargetHTML(data) {
+    // 48×48 降采样成 3×3 小图：瓦片内有任意黑像素即黑
+    var tw = W / COLS, th = H / ROWS;
+    var out = '<div class="mini">';
+    for (var t = 0; t < T; t++) {
+      var r = Math.floor(t / COLS), c = t % COLS;
+      var dark = false;
+      for (var y = r * th; y < (r + 1) * th && !dark; y++) {
+        for (var x = c * tw; x < (c + 1) * tw; x++) {
+          if (data[y * W + x]) { dark = true; break; }
+        }
+      }
+      out += '<i class="' + (dark ? 'dark' : '') + '"></i>';
+    }
+    return out + '</div>';
+  }
+
+  function countMiniHTML(counts) {
+    var out = '<div class="mini">';
+    for (var t = 0; t < T; t++) {
+      var v = counts[t];
+      var cls = v === 2 ? 'b2' : v === 1 ? 'b1' : '';
+      out += '<i class="' + cls + '">' + v + '</i>';
+    }
+    return out + '</div>';
+  }
+
+  function renderResult() {
+    var plan = session.plan;
+    $('result-empty').hidden = true;
+    $('result-body').hidden = false;
+
+    var cum = 0;
+    var summary = $('plan-summary');
+    summary.innerHTML =
+      '<span>总费用 <b>' + plan.totalCost + '</b></span>' +
+      '<span>全刷 <b>' + plan.fullRefreshCount + '</b> 次</span>' +
+      '<span>局刷 <b>' + plan.partialRefreshCount + '</b> 次</span>' +
+      '<span>动作序列 <b>' + plan.actions.join(' ') + '</b></span>' +
+      '<span class="muted">（规则：最小费用 → 全刷少 → F 先于 P；全刷恒合法且每帧准确显示目标）</span>';
+
+    var tbody = $('plan-tbody');
+    tbody.innerHTML = '';
+    plan.steps.forEach(function (step, i) {
+      cum += step.cost;
+      var tr = document.createElement('tr');
+      tr.className = 'step-row';
+      tr.dataset.index = i;
+
+      var changed = step.changedTiles;
+      var changedText;
+      if (!changed.length) {
+        changedText = '<span class="muted">无变化</span>';
+      } else {
+        changedText = changed.map(function (t) {
+          return tileName(t) + '(' + step.pixelChanges[t] + 'px)';
+        }).join(' ');
+      }
+
+      tr.innerHTML =
+        '<td>#' + (i + 1) + '</td>' +
+        '<td>' + miniTargetHTML(session.frames[i]) + '</td>' +
+        '<td><span class="badge ' + step.action + '">' +
+          (step.action === 'F' ? '全刷' : '局刷') + '</span></td>' +
+        '<td>' + step.cost + '<br><span class="muted">累计 ' + cum + '</span></td>' +
+        '<td style="text-align:left;font-size:11.5px">' + changedText + '</td>' +
+        '<td>' + countMiniHTML(step.countsBefore) + '</td>' +
+        '<td>' + countMiniHTML(step.countsAfter) + '</td>';
+      tr.addEventListener('click', function () { setPlayStep(i); });
+      tbody.appendChild(tr);
+    });
+  }
+
+  // ---------- 播放 ----------
+  var playPos = -1;   // -1 初始（全白、计数 0）；0..N-1 已执行第 i 步
+  var autoTimer = null;
+
+  function initPlayback() {
+    $('playback-disabled').hidden = true;
+    $('playback').hidden = false;
+    stopAuto();
+    playPos = -1;
+    var grid = $('count-grid');
+    grid.innerHTML = '';
+    for (var t = 0; t < T; t++) {
+      var d = document.createElement('div');
+      d.dataset.tile = t;
+      d.innerHTML = '<b>0</b><span>' + tileName(t) + '</span>';
+      grid.appendChild(d);
+    }
+    updatePlayback();
+  }
+
+  function updatePlayback() {
+    var plan = session.plan;
+    var data, counts, text, caption;
+    if (playPos < 0) {
+      data = new Uint8Array(W * H);
+      counts = new Array(T).fill(0);
+      caption = '初始屏显（全白）';
+      text = '尚未执行任何刷新。点击“下一步 ▶”执行第 1 帧的动作：<b>' +
+        actionText(plan.steps[0]) + '</b>。';
+    } else {
+      var step = plan.steps[playPos];
+      data = session.frames[playPos]; // 合法方案执行后准确显示目标
+      counts = step.countsAfter;
+      caption = '第 ' + (playPos + 1) + ' 帧执行后屏显';
+      text = '第 ' + (playPos + 1) + ' / ' + plan.nFrames + ' 帧：' + actionText(step) +
+        '<br>动作后各瓦片计数如上；' +
+        (playPos + 1 < plan.nFrames
+          ? '下一步（第 ' + (playPos + 2) + ' 帧）：' + actionText(plan.steps[playPos + 1])
+          : '<b>已是最后一帧。</b>');
+    }
+    renderFrameToCanvas(dctx, data, W, H);
+    $('display-caption').textContent = caption;
+    $('play-step-text').innerHTML = text;
+
+    var cells = $('count-grid').children;
+    for (var t = 0; t < T; t++) {
+      var v = counts[t];
+      cells[t].className = v === 2 ? 'g2' : v === 1 ? 'g1' : '';
+      cells[t].querySelector('b').textContent = v;
+    }
+
+    Array.prototype.forEach.call(document.querySelectorAll('tr.step-row'), function (row) {
+      row.classList.toggle('playing', Number(row.dataset.index) === playPos);
+    });
+
+    $('play-prev').disabled = playPos < 0;
+    $('play-first').disabled = playPos < 0;
+    $('play-next').disabled = playPos >= plan.nFrames - 1;
+  }
+
+  function actionText(step) {
+    if (step.action === 'F') return '<span class="badge F">全刷</span> 费用 600，全部瓦片计数清零';
+    if (!step.changedTiles.length) return '<span class="badge P">局刷</span> 无瓦片变化，费用 0';
+    return '<span class="badge P">局刷</span> 对 ' + step.changedTiles.length +
+      ' 块变化瓦片分别局刷，费用 ' + step.cost + '（' +
+      step.changedTiles.map(function (t) {
+        return tileName(t) + ' 30+' + step.pixelChanges[t];
+      }).join('，') + '）';
+  }
+
+  function setPlayStep(i) {
+    if (!session) return;
+    stopAuto();
+    playPos = i;
+    updatePlayback();
+  }
+  $('play-first').addEventListener('click', function () { setPlayStep(-1); });
+  $('play-prev').addEventListener('click', function () { if (playPos >= 0) setPlayStep(playPos - 1); });
+  $('play-next').addEventListener('click', function () {
+    if (playPos < session.plan.nFrames - 1) setPlayStep(playPos + 1);
+  });
+  function stopAuto() {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; $('play-auto').textContent = '▶ 自动播放'; }
+  }
+  $('play-auto').addEventListener('click', function () {
+    if (autoTimer) { stopAuto(); return; }
+    if (playPos >= session.plan.nFrames - 1) playPos = -1;
+    $('play-auto').textContent = '⏸ 暂停';
+    updatePlayback();
+    autoTimer = setInterval(function () {
+      if (playPos >= session.plan.nFrames - 1) { stopAuto(); return; }
+      playPos++;
+      updatePlayback();
+    }, 800);
+  });
+
+  // ---------- 导出 / 导入（导出与播放共用 session.plan） ----------
+  $('export-btn').addEventListener('click', function () {
+    if (!session || session.dirty) return;
+    var payload = {
+      format: 'epaper-refresh-plan/v1',
+      exportedAt: new Date().toISOString(),
+      model: {
+        width: W, height: H, rows: ROWS, cols: COLS,
+        fullCost: 600, partialBase: 30, maxGhost: 2
+      },
+      frames: session.frames.map(function (f) {
+        // 0/1 像素数组 → 紧凑 base64（每像素 1 bit）
+        var bytes = [];
+        for (var i = 0; i < f.length; i += 8) {
+          var b = 0;
+          for (var j = 0; j < 8 && i + j < f.length; j++) if (f[i + j]) b |= 1 << j;
+          bytes.push(b);
+        }
+        return btoa(String.fromCharCode.apply(null, bytes));
+      }),
+      plan: serializePlan(session.plan)
+    };
+    var blob = new Blob([JSON.stringify(payload, null, 1)], { type: 'application/json' });
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'epaper-plan-' + session.plan.totalCost + '.json';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  });
+
+  function serializePlan(plan) {
+    return {
+      totalCost: plan.totalCost,
+      fullRefreshCount: plan.fullRefreshCount,
+      partialRefreshCount: plan.partialRefreshCount,
+      actions: plan.actions,
+      steps: plan.steps.map(function (s) {
+        return {
+          frame: s.frame, action: s.action, cost: s.cost,
+          changedTiles: s.changedTiles,
+          pixelChanges: s.pixelChanges,
+          countsBefore: s.countsBefore,
+          countsAfter: s.countsAfter
+        };
+      })
+    };
+  }
+
+  $('import-btn').addEventListener('click', function () { $('import-file').click(); });
+  $('import-file').addEventListener('change', function (ev) {
+    var file = ev.target.files && ev.target.files[0];
+    ev.target.value = '';
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        var data = JSON.parse(reader.result);
+        var imported = importFrames(data);
+        if (!imported.length) throw new Error('文件中没有帧');
+        if (imported.length > MAX_FRAMES) throw new Error('帧数超过 ' + MAX_FRAMES);
+        frames = imported;
+        currentFrame = 0;
+        session = null;
+        $('result-empty').hidden = false;
+        $('result-body').hidden = true;
+        $('playback-disabled').hidden = false;
+        $('playback').hidden = true;
+        stopAuto();
+        markDirty();
+        renderAll();
+        runSolve(); // 导入后自动求解
+      } catch (e) {
+        setStatus('error', '导入失败：' + e.message);
+      }
+    };
+    reader.readAsText(file);
+  });
+
+  function importFrames(data) {
+    // 支持：本工具导出文件 {format, frames:[base64]}，或裸帧像素数组 [[0,1,...], ...]
+    var raw = data && data.format ? data.frames : data;
+    if (!Array.isArray(raw)) throw new Error('无法识别的帧数据');
+    return raw.map(function (frame, idx) {
+      var out = new Uint8Array(W * H);
+      if (typeof frame === 'string') {
+        var bin = atob(frame);
+        for (var i = 0; i < W * H; i++) {
+          var code = bin.charCodeAt(i >> 3) || 0;
+          if ((code >> (i & 7)) & 1) out[i] = 1;
+        }
+      } else if (frame && typeof frame.length === 'number' && frame.length === W * H) {
+        for (var j = 0; j < out.length; j++) out[j] = frame[j] ? 1 : 0;
+      } else {
+        throw new Error('第 ' + (idx + 1) + ' 帧长度应为 ' + (W * H));
+      }
+      return out;
+    });
+  }
+
+  // ---------- 初始化 ----------
+  renderAll();
+})();
+</script>
+</body>
+</html>

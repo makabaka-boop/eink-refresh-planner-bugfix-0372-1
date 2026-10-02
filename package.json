@@ -1,0 +1,11 @@
+{
+  "name": "epaper-refresh-planner",
+  "version": "1.0.0",
+  "description": "离线电子纸刷新规划：48×48 黑白像素 / 3×3 固定瓦片 / ≤20 帧，Worker 在整段帧序列上求总费用最小的合法刷新方案",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/planner.test.js",
+    "smoke": "node test/dom-smoke.js"
+  },
+  "license": "MIT"
+}
