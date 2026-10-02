@@ -179,7 +179,8 @@
   <h1>离线电子纸刷新规划</h1>
   <span class="rules">
     48×48 黑白像素 · 3×3 固定瓦片（每瓦 16×16）· 至多 20 帧 ·
-    全刷 600（全部计数清零）· 局刷每瓦 30＋改变像素数（该瓦计数 +1）· 计数上限 2 ·
+    默认全刷 600（全部计数清零）· 默认局刷每瓦 30＋改变像素数（该瓦计数 +1）· 计数上限 2 ·
+    每帧可单独指定必须全刷/必须局刷及当帧两种费用 ·
     整段序列 DP：总费用最小 → 全刷次数少 → 逐帧全刷先于局刷
   </span>
 </header>
@@ -290,16 +291,20 @@
   // ---------- 常量 ----------
   var W = 48, H = 48, ROWS = 3, COLS = 3, T = 9, MAX_FRAMES = 20;
   var SCALE = 6; // 编辑画布：48*6=288
+  var DEFAULT_FULL_COST = 600;
+  var DEFAULT_PARTIAL_BASE = 30;
+  var DEFAULT_MODE = 'either';
 
   // ---------- 编辑状态 ----------
   var frames = [new Uint8Array(W * H)]; // 初始一帧全白
-  var frameModes = ['either'];
-  var frameFullCosts = [600];
-  var framePartialBases = [30];
+  var frameModes = [DEFAULT_MODE];
+  var frameFullCosts = [DEFAULT_FULL_COST];
+  var framePartialBases = [DEFAULT_PARTIAL_BASE];
   var currentFrame = 0;
   var brush = 1;          // 1 黑 / 0 白
   var painting = false;
   var dirty = true;       // 帧相对当前方案是否已改动
+  var editSeq = 0;        // 编辑代次：每次帧/约束改动 +1，用于识别求解途中的改动
 
   // ---------- 求解结果（导出与播放共用这一个对象） ----------
   var session = null;     // { plan, frames(快照), dirty }
@@ -429,6 +434,7 @@
 
   function markDirty() {
     dirty = true;
+    editSeq++;
     if (session) session.dirty = true;
     refreshDirtyUI();
   }
@@ -497,9 +503,9 @@
   $('frame-add').addEventListener('click', function () {
     if (frames.length >= MAX_FRAMES) return;
     frames.push(new Uint8Array(frames[currentFrame]));
-    frameModes.push('either');
-    frameFullCosts.push(600);
-    framePartialBases.push(30);
+    frameModes.push(DEFAULT_MODE);
+    frameFullCosts.push(DEFAULT_FULL_COST);
+    framePartialBases.push(DEFAULT_PARTIAL_BASE);
     currentFrame = frames.length - 1;
     markDirty(); renderAll();
   });
@@ -517,12 +523,22 @@
     frameModes[currentFrame] = ev.target.value;
     markDirty();
   });
+
+  // 费用输入：空串/负数/非整数回落默认值，避免 NaN 进入求解
+  function parseCostInput(ev, fallback) {
+    var n = Number(ev.target.value);
+    if (!isFinite(n) || n < 0 || Math.floor(n) !== n) {
+      ev.target.value = String(fallback);
+      return fallback;
+    }
+    return n;
+  }
   $('frame-full-cost').addEventListener('input', function (ev) {
-    frameFullCosts[currentFrame] = Number(ev.target.value);
+    frameFullCosts[currentFrame] = parseCostInput(ev, DEFAULT_FULL_COST);
     markDirty();
   });
   $('frame-partial-base').addEventListener('input', function (ev) {
-    framePartialBases[currentFrame] = Number(ev.target.value);
+    framePartialBases[currentFrame] = parseCostInput(ev, DEFAULT_PARTIAL_BASE);
     markDirty();
   });
 
@@ -532,35 +548,65 @@
     statusEl.textContent = text || '';
   }
 
+  function buildSolveOptions() {
+    return {
+      rows: ROWS, cols: COLS, width: W, height: H,
+      fullCost: DEFAULT_FULL_COST, partialBase: DEFAULT_PARTIAL_BASE, maxGhost: 2,
+      frameModes: frameModes.slice(),
+      frameFullCosts: frameFullCosts.slice(),
+      framePartialBases: framePartialBases.slice()
+    };
+  }
+
   function runSolve() {
     var payloadFrames = frames.map(function (f) { return new Uint8Array(f); });
+    var solveOptions = buildSolveOptions();
+    var seqAtRequest = editSeq;
     $('solve-btn').disabled = true;
     setStatus('busy', 'Worker 正在整段帧序列上求解…');
-    supervisor.solve({
+    var p = supervisor.solve({
       frames: payloadFrames,
-      options: { rows: ROWS, cols: COLS, width: W, height: H, fullCost: 600, partialBase: 30, maxGhost: 2,
-        frameModes: frameModes.slice(), frameFullCosts: frameFullCosts.slice(),
-        framePartialBases: framePartialBases.slice() }
-    }).then(function (plan) {
-      session = { plan: plan, frames: payloadFrames, dirty: false };
+      options: solveOptions
+    });
+    p.then(function (plan) {
+      // 求解发起后帧/约束又被改动：结果属于旧输入，只能按过期方案展示
+      if (seqAtRequest !== editSeq) {
+        session = { plan: plan, frames: payloadFrames, constraints: solveOptions, dirty: true };
+        refreshDirtyUI();
+        renderResult();
+        initPlayback();
+        setStatus('stale-warn',
+          '⚠ 返回的方案基于求解发起时的帧；此后帧或约束已修改，导出已锁定，请重新求解。');
+        return null;
+      }
+      session = { plan: plan, frames: payloadFrames, constraints: solveOptions, dirty: false };
       dirty = false;
       setStatus('', '✓ 求解完成：总费用 ' + plan.totalCost +
         '（全刷 ' + plan.fullRefreshCount + ' 次，局刷 ' + plan.partialRefreshCount + ' 次）。');
       renderResult();
       initPlayback();
       refreshDirtyUI();
-    }).catch(function (err) {
+      return plan;
+    }, function (err) {
       if (err && err.code === 'SUPERSEDED') {
         setStatus('busy', '旧请求已被新的求解请求取代…');
       } else if (err && err.code === 'TERMINATED') {
         setStatus('error', '求解器已终止。');
+      } else if (seqAtRequest !== editSeq) {
+        // 求解途中已修改输入：错误同样可能源于旧输入，按过期处理而非内部错误
+        setStatus('stale-warn', '⚠ 求解期间帧或约束已修改，该结果已过期，请重新求解。');
       } else {
         setStatus('error', '求解失败：' + (err && err.message ? err.message : err));
       }
+      return null;
     }).then(function () {
       $('solve-btn').disabled = false;
     });
+    // 错误状态已在上面的 rejection 分支中显示；吞掉链尾 rejection，避免未处理拒绝
+    p.then(noop, noop);
+    return p;
   }
+  function noop() {}
   $('solve-btn').addEventListener('click', runSolve);
 
   // ---------- 结果表 ----------
@@ -700,12 +746,16 @@
   }
 
   function actionText(step) {
-    if (step.action === 'F') return '<span class="badge F">全刷</span> 费用 600，全部瓦片计数清零';
+    if (step.action === 'F') {
+      var fc = step.frameFullCost !== undefined ? step.frameFullCost : step.cost;
+      return '<span class="badge F">全刷</span> 费用 ' + fc + '，全部瓦片计数清零';
+    }
     if (!step.changedTiles.length) return '<span class="badge P">局刷</span> 无瓦片变化，费用 0';
+    var base = step.framePartialBase !== undefined ? step.framePartialBase : DEFAULT_PARTIAL_BASE;
     return '<span class="badge P">局刷</span> 对 ' + step.changedTiles.length +
       ' 块变化瓦片分别局刷，费用 ' + step.cost + '（' +
       step.changedTiles.map(function (t) {
-        return tileName(t) + ' 30+' + step.pixelChanges[t];
+        return tileName(t) + ' ' + base + '+' + step.pixelChanges[t];
       }).join('，') + '）';
   }
 
@@ -743,7 +793,20 @@
       exportedAt: new Date().toISOString(),
       model: {
         width: W, height: H, rows: ROWS, cols: COLS,
-        fullCost: 600, partialBase: 30, maxGhost: 2
+        fullCost: DEFAULT_FULL_COST, partialBase: DEFAULT_PARTIAL_BASE, maxGhost: 2
+      },
+      constraints: {
+        frameModes: session.frames.map(function (_, i) {
+          return session.constraints.frameModes[i] || DEFAULT_MODE;
+        }),
+        frameFullCosts: session.frames.map(function (_, i) {
+          var v = session.constraints.frameFullCosts[i];
+          return v === undefined ? DEFAULT_FULL_COST : v;
+        }),
+        framePartialBases: session.frames.map(function (_, i) {
+          var v = session.constraints.framePartialBases[i];
+          return v === undefined ? DEFAULT_PARTIAL_BASE : v;
+        })
       },
       frames: session.frames.map(function (f) {
         // 0/1 像素数组 → 紧凑 base64（每像素 1 bit）
@@ -774,6 +837,8 @@
       steps: plan.steps.map(function (s) {
         return {
           frame: s.frame, action: s.action, cost: s.cost,
+          frameFullCost: s.frameFullCost,
+          framePartialBase: s.framePartialBase,
           changedTiles: s.changedTiles,
           pixelChanges: s.pixelChanges,
           countsBefore: s.countsBefore,
@@ -797,6 +862,22 @@
         if (imported.length > MAX_FRAMES) throw new Error('帧数超过 ' + MAX_FRAMES);
         frames = imported;
         currentFrame = 0;
+        // 恢复随文件保存的逐帧约束（缺省/裸帧文件回落全局默认），
+        // 保证“导出再导入”重新求解得到同一份方案
+        frameModes = imported.map(function (_, i) {
+          var m = data.constraints && data.constraints.frameModes ? data.constraints.frameModes[i] : DEFAULT_MODE;
+          return m === 'F' || m === 'P' ? m : DEFAULT_MODE;
+        });
+        frameFullCosts = imported.map(function (_, i) {
+          var v = data.constraints && data.constraints.frameFullCosts ?
+            Number(data.constraints.frameFullCosts[i]) : DEFAULT_FULL_COST;
+          return isFinite(v) && v >= 0 && Math.floor(v) === v ? v : DEFAULT_FULL_COST;
+        });
+        framePartialBases = imported.map(function (_, i) {
+          var v = data.constraints && data.constraints.framePartialBases ?
+            Number(data.constraints.framePartialBases[i]) : DEFAULT_PARTIAL_BASE;
+          return isFinite(v) && v >= 0 && Math.floor(v) === v ? v : DEFAULT_PARTIAL_BASE;
+        });
         session = null;
         $('result-empty').hidden = false;
         $('result-body').hidden = true;
@@ -805,7 +886,15 @@
         stopAuto();
         markDirty();
         renderAll();
-        runSolve(); // 导入后自动求解
+        var exportedPlan = data.plan || null;
+        runSolve().then(function (plan) {
+          // 导出再导入：当前帧与费用必须能重现原方案
+          if (plan && exportedPlan &&
+              (plan.totalCost !== exportedPlan.totalCost ||
+               JSON.stringify(plan.actions) !== JSON.stringify(exportedPlan.actions))) {
+            setStatus('error', '⚠ 导入文件可求解，但按其中帧与费用重现的方案与文件内方案不一致');
+          }
+        }, function () { /* 失败状态已由 runSolve 显示 */ });
       } catch (e) {
         setStatus('error', '导入失败：' + e.message);
       }

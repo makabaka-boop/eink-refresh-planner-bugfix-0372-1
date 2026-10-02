@@ -397,3 +397,169 @@ test('maxGhost=1 随机网格对拍（每瓦至多局刷 1 次就必须全刷）
     assert.equal(dp.totalCost, bf.totalCost, `iter=${iter}`);
   }
 });
+
+// ---------- 逐帧刷新方式约束（必须全刷 / 必须局刷） ----------
+
+test('必须全刷：无约束最优为 P 时，帧约束改为 F 后 DP 选 F 且 simulate 合法（不再内部错误）', () => {
+  const tr = transitions([[1]]);
+  const opts = { rows: 1, cols: 1, width: 1, height: 1, frameModes: ['F'] };
+  const plan = solvePlan(tr, opts);
+  assert.deepEqual(plan.actions, ['F']);
+  assert.equal(plan.totalCost, 600);
+  assert.deepEqual(plan.steps[0].countsAfter, [0]);
+  // 被禁止的动作在 simulate 中也非法
+  assert.equal(simulate(tr, ['P'], opts).legal, false);
+});
+
+test('必须局刷：强制 P 优先于同帧更贵/更便宜的 F，按约束选择', () => {
+  // 两瓦片同时翻转：P=2*(30+1)=62 < F=600，但帧0强制 F → F,P；
+  // 反向把帧1强制 F（无约束时帧1无变化P费用0）→ P,F 费用 662
+  const tr = transitionsForMasks([[1, 1], [1, 1]]); // 帧0变化，帧1无变化
+  const base = { rows: 1, cols: 2, width: 2, height: 1 };
+  const pF = solvePlan(tr, Object.assign({}, base, { frameModes: ['F', 'either'] }));
+  assert.deepEqual(pF.actions, ['F', 'P']);
+  assert.equal(pF.totalCost, 600);
+  const pP = solvePlan(tr, Object.assign({}, base, { frameModes: ['either', 'F'] }));
+  assert.deepEqual(pP.actions, ['P', 'F']);
+  assert.equal(pP.totalCost, 62 + 600);
+});
+
+test('不可行帧段：连续 3 帧变化且全部必须局刷 → 报 INFEASIBLE 而非内部错误', () => {
+  const tr = transitions([[1], [0], [1]]);
+  const opts = { rows: 1, cols: 1, width: 1, height: 1, frameModes: ['P', 'P', 'P'] };
+  let caught;
+  assert.throws(() => { try { solvePlan(tr, opts); } catch (e) { caught = e; throw e; } },
+    /第 2 帧/);
+  assert.equal(caught.code, 'INFEASIBLE');
+  assert.throws(() => bruteForcePlan(tr, opts), /无合法刷新方案/);
+});
+
+test('不可行帧段定位：中间强制全刷会重置计数，帧段从最近一次强制 F 之后起算', () => {
+  // 帧0..2 强制 P 合法（计数最多到 2 的临界），构造帧0F,1P,2P,3P 强制：
+  // 单瓦片每帧翻转，F 后连续 3 个 P 非法 → 不可行段为 1..3
+  const tr = transitions([[1], [0], [1], [0]]);
+  const opts = { rows: 1, cols: 1, width: 1, height: 1, frameModes: ['F', 'P', 'P', 'P'] };
+  let caught;
+  try { solvePlan(tr, opts); } catch (e) { caught = e; }
+  assert.ok(caught, '应抛出不可行错误');
+  assert.equal(caught.code, 'INFEASIBLE');
+  assert.match(caught.message, /第 1–3 帧/);
+});
+
+test('强制全刷帧本身恒合法（即使全部帧段被 P 约束压满）', () => {
+  // 连续 3 帧翻转：帧2强制 F 后 PPP 的非法性解除 → PPF
+  const tr = transitions([[1], [0], [1]]);
+  const plan = solvePlan(tr, {
+    rows: 1, cols: 1, width: 1, height: 1, frameModes: ['either', 'either', 'F']
+  });
+  assert.deepEqual(plan.actions, ['P', 'P', 'F']);
+  assert.equal(plan.totalCost, 31 + 31 + 600);
+});
+
+// ---------- 逐帧费用 ----------
+
+test('逐帧全刷费用：DP 使用当帧 fullCost 而非全局值', () => {
+  const tr = transitions([[1], [0]]);
+  const opts = { rows: 1, cols: 1, width: 1, height: 1, frameFullCosts: [10, 600] };
+  const plan = solvePlan(tr, opts);
+  assert.deepEqual(plan.actions, ['F', 'P']); // 10+31=41 < 31+31=62
+  assert.equal(plan.totalCost, 41);
+  assert.equal(plan.steps[0].cost, 10);
+  assert.equal(plan.steps[1].cost, 31);
+  // simulate 口径一致
+  assert.equal(simulate(tr, plan.actions, opts).cost, 41);
+  assert.deepEqual(bruteForcePlan(tr, opts).actions, ['F', 'P']);
+});
+
+test('逐帧局刷基础费用：无变化帧费用恒 0；有变化帧按当帧 base 计价', () => {
+  const tr = transitions([[1], [0]]);
+  const opts = { rows: 1, cols: 1, width: 1, height: 1, framePartialBases: [0, 30] };
+  const plan = solvePlan(tr, opts);
+  assert.deepEqual(plan.actions, ['P', 'P']);
+  assert.equal(plan.totalCost, 1 + 31); // 帧0 每瓦 0+1
+  assert.equal(plan.steps[0].framePartialBase, 0);
+  assert.equal(plan.steps[1].framePartialBase, 30);
+});
+
+test('逐帧费用+约束+maxGhost 随机对拍（DP 与全枚举完全一致）', () => {
+  const rng = mulberry32(20261002);
+  for (let iter = 0; iter < 400; iter++) {
+    const rows = 1, cols = 1 + Math.floor(rng() * 2); // 1..2 瓦片
+    const T = rows * cols;
+    const N = 1 + Math.floor(rng() * 8);
+    const maxGhost = 1 + Math.floor(rng() * 2);
+    const frames = [];
+    const prev = new Array(T).fill(0);
+    for (let i = 0; i < N; i++) {
+      const cur = new Array(T);
+      for (let t = 0; t < T; t++) cur[t] = rng() < 0.5 ? (prev[t] ? 0 : 1) : prev[t];
+      frames.push(cur);
+      prev.splice(0, T, ...cur);
+    }
+    const tr = transitions(frames);
+    const frameModes = frames.map(() => {
+      const r = rng();
+      return r < 0.7 ? 'either' : r < 0.85 ? 'F' : 'P';
+    });
+    const frameFullCosts = frames.map(() => 20 + Math.floor(rng() * 400));
+    const framePartialBases = frames.map(() => Math.floor(rng() * 60));
+    const opts = {
+      rows, cols, width: cols * 2, height: rows * 2, maxGhost,
+      fullCost: 300, partialBase: 25,
+      frameModes, frameFullCosts, framePartialBases
+    };
+    let dp, bf;
+    try {
+      dp = solvePlan(tr, opts);
+    } catch (e) {
+      assert.equal(e.code, 'INFEASIBLE', `iter=${iter} 非不可行错误: ${e.message}`);
+      assert.throws(() => bruteForcePlan(tr, opts), /无合法刷新方案/);
+      continue;
+    }
+    bf = bruteForcePlan(tr, opts);
+    assert.equal(dp.totalCost, bf.totalCost, `费用不一致 iter=${iter}`);
+    assert.equal(dp.fullRefreshCount, bf.fullRefreshCount, `全刷数不一致 iter=${iter}`);
+    assert.deepEqual(dp.actions, bf.actions, `动作序列不一致 iter=${iter}`);
+    const sim = simulate(tr, dp.actions, opts);
+    assert.equal(sim.legal, true, `DP 方案被 simulate 判非法 iter=${iter}`);
+    assert.equal(sim.cost, dp.totalCost, `simulate 费用不一致 iter=${iter}`);
+  }
+});
+
+test('非法约束值被拒绝（模式/费用）', () => {
+  const tr = transitions([[1]]);
+  const base = { rows: 1, cols: 1, width: 1, height: 1 };
+  assert.throws(() => solvePlan(tr, Object.assign({}, base, { frameModes: ['x'] })), /either\/F\/P/);
+  assert.throws(() => solvePlan(tr, Object.assign({}, base, { frameFullCosts: [-1] })), /非负整数/);
+  assert.throws(() => solvePlan(tr, Object.assign({}, base, { framePartialBases: [NaN] })), /非负整数/);
+  assert.throws(() => solvePlan(tr, Object.assign({}, base, { frameModes: 'F' })), /frameModes 必须是数组/);
+});
+
+test('Worker 源码支持逐帧约束与费用（vm 执行真实 buildWorkerSource）', async () => {
+  const handlers = { message: null };
+  const sandbox = {
+    self: { onmessage: null, postMessage(msg) { queue.push({ data: msg }); } }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(buildWorkerSource(), sandbox);
+  const queue = [];
+  const post = (msg) => sandbox.self.onmessage({ data: msg });
+  const flush = () => { const qs = queue.splice(0); qs.forEach(q => handlers.message(q)); };
+
+  const sup = createSupervisor((onMsg) => {
+    handlers.message = onMsg;
+    return { post, terminate() {} };
+  });
+
+  const tr = transitions([[1], [0]]);
+  const opts = {
+    rows: 1, cols: 1, width: 1, height: 1,
+    frameModes: ['F', 'P'], frameFullCosts: [10, 600], framePartialBases: [5, 30]
+  };
+  const p = sup.solve({ transitions: tr, options: opts });
+  flush();
+  const plan = await p;
+  assert.deepEqual(JSON.parse(JSON.stringify(plan.actions)), ['F', 'P']); // vm 跨 realm
+  assert.equal(plan.totalCost, 10 + 31);
+});
+

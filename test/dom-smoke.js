@@ -50,7 +50,11 @@ function makeElement(tag) {
       }
       return [];
     },
-    click() { (el.handlers.click || []).forEach(fn => fn({ target: el })); }
+    click() {
+      (el.handlers.click || []).forEach(fn => fn({
+        target: el, preventDefault() {}, stopPropagation() {}
+      }));
+    }
   };
   Object.defineProperty(el, 'innerHTML', {
     get() { return el._html; },
@@ -287,6 +291,106 @@ function runSmoke() {
         fileInput.handlers.change[0]({ target: fileInput });
         await pumpTimers();
         assert.match(byId.get('solve-status').textContent, /总费用 67/);
+
+        // —— 逐帧约束：第 1 帧必须全刷，且把当帧全刷费用改为 123 ——
+        // （约束/费用改动后旧方案应立即过期、导出锁定）
+        strip.children[0].click();
+        const modeSel = byId.get('frame-mode');
+        modeSel.value = 'F';
+        modeSel.handlers.change[0]({ target: modeSel });
+        const fullInput = byId.get('frame-full-cost');
+        fullInput.value = '123';
+        fullInput.handlers.input[0]({ target: fullInput });
+        assert.equal(byId.get('export-btn').disabled, true);
+        assert.equal(byId.get('stale-banner').hidden, false);
+
+        byId.get('solve-btn').click();
+        await pumpTimers();
+        // 帧0 强制 F=123；帧1 局刷 32 → 总 155
+        assert.match(byId.get('plan-summary').innerHTML, /<b>155<\/b>/);
+        assert.match(byId.get('plan-summary').innerHTML, />F P</);
+        assert.equal(byId.get('export-btn').disabled, false);
+        assert.equal(byId.get('stale-banner').hidden, true);
+        // 播放说明必须使用当帧费用 123，而非硬编码 600
+        byId.get('play-next').click();
+        assert.match(byId.get('play-step-text').innerHTML, /费用 123/);
+        assert.doesNotMatch(byId.get('play-step-text').innerHTML, /费用 600/);
+
+        // 结果表费用列与累计一致：123 / 累计 123；第二行 32 / 累计 155
+        const rows = document.querySelectorAll('tr.step-row');
+        assert.match(tbody.children[0].innerHTML, /123/);
+        assert.match(tbody.children[1].innerHTML, /累计 155/);
+        assert.equal(rows.length, 2);
+
+        // 再导出：JSON 必须携带逐帧约束与费用
+        byId.get('export-btn').click();
+        const constrainedJson = JSON.parse(lastBlobText);
+        assert.equal(constrainedJson.constraints.frameModes[0], 'F');
+        assert.equal(constrainedJson.constraints.frameFullCosts[0], 123);
+        assert.equal(constrainedJson.plan.totalCost, 155);
+        assert.deepEqual(constrainedJson.plan.actions, ['F', 'P']);
+        assert.equal(constrainedJson.plan.steps[0].frameFullCost, 123);
+
+        // 导入该文件：恢复约束后自动重解，必须重现 155 / F P
+        sandbox.FileReader = class {
+          readAsText() { this.result = lastBlobText; setTimeout(() => this.onload(), 0); }
+        };
+        fileInput.value = '';
+        fileInput.handlers.change[0]({ target: fileInput });
+        await pumpTimers();
+        assert.match(byId.get('solve-status').textContent, /总费用 155/);
+        assert.match(byId.get('plan-summary').innerHTML, />F P</);
+
+        // —— 不可行约束给出明确错误而非“内部错误”：
+        // 当前导入后为 2 帧（帧0 瓦片0 五像素黑；帧1 瓦片0 五像素黑 + 瓦片4 两像素黑）。
+        // 新增一帧：擦掉瓦片0 的 5 个像素，使瓦片0 在第 3 帧翻转；
+        // 于是瓦片0 的变化为 帧0: 白→黑、帧1: 无变化、帧2: 黑→白（仅 2 次，合法）。
+        // 改为把三帧全部强制局刷并让瓦片0 连续三帧都翻转：
+        //   帧1 擦掉瓦片0 五像素（黑→白），帧2 再画回（白→黑），即 有/无/有 三翻。
+        strip.children[0].click();
+        byId.get('tool-eraser').click();
+        // 帧1：擦瓦片0
+        strip.children[1].click();
+        for (let xx = 0; xx < 5; xx++) down(fakePointer(xx, 0));
+        // 复制帧1 得到帧2（同为擦除状态），再在帧2 画回
+        byId.get('frame-add').click();
+        byId.get('tool-pencil').click();
+        strip.children[2].click();
+        for (let xx = 0; xx < 5; xx++) down(fakePointer(xx, 0));
+        // 三帧全部强制局刷
+        for (let fi = 0; fi < 3; fi++) {
+          strip.children[fi].click();
+          modeSel.value = 'P';
+          modeSel.handlers.change[0]({ target: modeSel });
+        }
+        byId.get('solve-btn').click();
+        await pumpTimers();
+        assert.equal(byId.get('solve-status').className, 'error');
+        assert.match(byId.get('solve-status').textContent, /不存在合法刷新方案/);
+        assert.doesNotMatch(byId.get('solve-status').textContent, /内部错误/);
+
+        // —— 求解期间改动约束：旧结果到达时不得冒充新方案 ——
+        // 恢复为合法约束（三帧自动选择）后发起求解，在定时器（worker 回包）执行前修改第 1 帧
+        for (let fi = 0; fi < 3; fi++) {
+          strip.children[fi].click();
+          modeSel.value = 'either';
+          modeSel.handlers.change[0]({ target: modeSel });
+        }
+        byId.get('solve-btn').click();           // worker 回包在 setTimeout 中排队
+        assert.match(byId.get('solve-status').textContent, /正在整段/);
+        strip.children[0].click();
+        modeSel.value = 'F';
+        modeSel.handlers.change[0]({ target: modeSel }); // 求解途中改动
+        await pumpTimers();
+        assert.equal(byId.get('export-btn').disabled, true, '迟到结果必须保持导出锁定');
+        assert.equal(byId.get('stale-banner').hidden, false);
+        assert.match(byId.get('solve-status').textContent, /已修改/);
+        // 重新求解后恢复正常
+        byId.get('solve-btn').click();
+        await pumpTimers();
+        assert.equal(byId.get('export-btn').disabled, false);
+        assert.equal(byId.get('stale-banner').hidden, true);
+        assert.match(byId.get('solve-status').textContent, /求解完成/);
 
         resolve({ downloads, json });
       } catch (e) {

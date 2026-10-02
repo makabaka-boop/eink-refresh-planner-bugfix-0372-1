@@ -10,6 +10,11 @@
  *                  费用 Σ(partialBase + 该瓦片改变像素数)（partialBase 默认 30），
  *                  每个发生变化的瓦片计数 +1；未变化瓦片计数不变。
  *     任一瓦片计数不得超过 maxGhost；因此局刷前某变化瓦片计数已达上限则该动作非法。
+ *   - 每帧可通过 options.frameModes[i] 指定约束：'either'（默认）/ 'F'（必须全刷）/
+ *     'P'（必须局刷）；被约束禁止的动作不参与转移。
+ *   - options.frameFullCosts[i] / framePartialBases[i] 可逐帧覆盖当帧全刷费用与
+ *     局刷每瓦基础费用，缺位回落全局 fullCost / partialBase。
+ *   - 强制局刷可能使某帧段无合法方案：solvePlan 抛出 code='INFEASIBLE' 并标出帧段。
  *
  * 在【整段帧序列】上做动态规划求总费用最小的合法方案；
  * 同价裁决顺序：① 全刷次数少  ② 动作序列逐帧“全刷先于局刷”（F < P）。
@@ -41,13 +46,48 @@
       fullCost: nonNegInt(opts.fullCost, DEFAULT_OPTIONS.fullCost),
       partialBase: nonNegInt(opts.partialBase, DEFAULT_OPTIONS.partialBase),
       maxGhost: positiveInt(opts.maxGhost, DEFAULT_OPTIONS.maxGhost),
-      frameModes: Array.isArray(opts.frameModes) ? opts.frameModes.slice() : [],
-      frameFullCosts: Array.isArray(opts.frameFullCosts) ? opts.frameFullCosts.slice() : [],
-      framePartialBases: Array.isArray(opts.framePartialBases) ? opts.framePartialBases.slice() : []
+      frameModes: sanitizeFrameModes(opts.frameModes),
+      frameFullCosts: sanitizeFrameCosts(opts.frameFullCosts, 'frameFullCosts'),
+      framePartialBases: sanitizeFrameCosts(opts.framePartialBases, 'framePartialBases')
     };
     if (o.width % o.cols !== 0) throw new Error('width 必须能被 cols 整除');
     if (o.height % o.rows !== 0) throw new Error('height 必须能被 rows 整除');
     return o;
+  }
+
+  var VALID_MODES = { either: true, F: true, P: true };
+
+  function sanitizeFrameModes(v) {
+    if (v === undefined || v === null) return [];
+    if (!Array.isArray(v)) throw new Error('frameModes 必须是数组');
+    var out = [];
+    for (var i = 0; i < v.length; i++) {
+      var m = v[i] === undefined || v[i] === null || v[i] === '' ? 'either' : v[i];
+      if (typeof m !== 'string' || !VALID_MODES[m]) {
+        throw new Error('第 ' + i + ' 帧刷新方式只能是 either/F/P，得到: ' + v[i]);
+      }
+      out.push(m);
+    }
+    return out;
+  }
+
+  function sanitizeFrameCosts(v, name) {
+    if (v === undefined || v === null) return [];
+    if (!Array.isArray(v)) throw new Error(name + ' 必须是数组');
+    var out = [];
+    for (var i = 0; i < v.length; i++) {
+      if (v[i] === undefined || v[i] === null) continue; // 缺位回落全局值
+      var cv = Number(v[i]);
+      if (!isFinite(cv) || cv < 0 || Math.floor(cv) !== cv) {
+        throw new Error(name + '[' + i + '] 必须是非负整数，得到: ' + v[i]);
+      }
+      out[i] = cv;
+    }
+    return out;
+  }
+
+  function frameAt(arr, i, fallback) {
+    return arr && arr[i] !== undefined ? arr[i] : fallback;
   }
 
   function positiveInt(v, d) {
@@ -216,22 +256,23 @@
       var cost = 0;
       var action = actions[i];
 
-      var required = o.frameModes[i] || 'either';
+      var required = frameAt(o.frameModes, i, 'either');
       if (required !== 'either' && action !== required) {
         return { legal: false, cost: total, fulls: fulls, steps: steps };
       }
 
       if (action === 'F') {
-        cost = o.frameFullCosts[i] === undefined ? o.fullCost : o.frameFullCosts[i];
+        cost = frameAt(o.frameFullCosts, i, o.fullCost);
         fulls++;
         for (var t1 = 0; t1 < T; t1++) counts[t1] = 0;
       } else if (action === 'P') {
+        var pbase = frameAt(o.framePartialBases, i, o.partialBase);
         for (var t2 = 0; t2 < T; t2++) {
           if (tr.changed[t2]) {
             if (counts[t2] >= o.maxGhost) { legal = false; }
             changedTiles.push(t2);
             pixelChanges[t2] = tr.pixels[t2];
-            cost += (o.framePartialBases[i] === undefined ? o.partialBase : o.framePartialBases[i]) + tr.pixels[t2];
+            cost += pbase + tr.pixels[t2];
           }
         }
         if (legal) {
@@ -248,6 +289,8 @@
           action: action,
           fullRefresh: action === 'F',
           cost: cost,
+          frameFullCost: action === 'F' ? cost : frameAt(o.frameFullCosts, i, o.fullCost),
+          framePartialBase: frameAt(o.framePartialBases, i, o.partialBase),
           changedTiles: changedTiles,
           pixelChanges: Array.prototype.slice.call(pixelChanges),
           countsBefore: before,
@@ -279,30 +322,37 @@
     var N = list.length;
     var p3 = powersOf3(T);
 
-    // 预计算每帧局刷费用与变化瓦片
+    // 预计算每帧全刷/局刷费用与变化瓦片
     var partialCost = new Int32Array(N);
+    var fullCost = new Int32Array(N);
+    var mode = new Array(N);
     var changedList = [];
     for (var i = 0; i < N; i++) {
       var tiles = [];
+      var base = frameAt(o.framePartialBases, i, o.partialBase);
       var pc = 0;
       for (var t = 0; t < T; t++) {
         if (list[i].changed[t]) {
           tiles.push(t);
-          pc += o.partialBase + list[i].pixels[t];
+          pc += base + list[i].pixels[t];
         }
       }
       changedList.push(tiles);
       partialCost[i] = pc;
+      fullCost[i] = frameAt(o.frameFullCosts, i, o.fullCost);
+      mode[i] = o.frameModes[i] || 'either';
     }
 
     // Map<state编码, {c费用, f全刷次数, b动作位串}>（帧 0 在最高位）
     var states = new Map();
     states.set(0, { c: 0, f: 0, b: 0 });
+    var lastForcedF = -1; // 上一帧“必须全刷”的帧（用于定位不可行帧段）
 
     for (var frame = 0; frame < N; frame++) {
       var next = new Map();
       var bit = 1 << (N - 1 - frame); // 帧 0 → 最高位：数值小者 F 靠前
       var changed = changedList[frame];
+      var required = mode[frame];
 
       var entries = states.entries();
       var e;
@@ -310,26 +360,39 @@
         var s = e.value[0];
         var v = e.value[1];
 
-        // 动作 F：全刷，状态归零（合法转移恒存在，故每个帧序列至少有一个合法方案）
-        var fc = v.c + o.fullCost;
-        var ff = v.f + 1;
-        var bf = v.b; // F → 位 0
-        putBest(next, 0, fc, ff, bf);
-
-        // 动作 P：任一变化瓦片计数已达上限则非法
-        var ns = s;
-        var ok = true;
-        for (var k = 0; k < changed.length; k++) {
-          var tile = changed[k];
-          var cnt = Math.floor(s / p3[tile]) % 3;
-          if (cnt >= o.maxGhost) { ok = false; break; }
-          ns += p3[tile];
+        // 动作 F：全刷，状态归零（“必须局刷”帧不可走此边）
+        if (required !== 'P') {
+          putBest(next, 0, v.c + fullCost[frame], v.f + 1, v.b /* F → 位 0 */);
         }
-        if (ok) {
-          putBest(next, ns, v.c + partialCost[frame], v.f, v.b | bit);
+
+        // 动作 P：“必须全刷”帧不可走；任一变化瓦片计数已达上限则非法
+        if (required !== 'F') {
+          var ns = s;
+          var ok = true;
+          for (var k = 0; k < changed.length; k++) {
+            var tile = changed[k];
+            var cnt = Math.floor(s / p3[tile]) % 3;
+            if (cnt >= o.maxGhost) { ok = false; break; }
+            ns += p3[tile];
+          }
+          if (ok) {
+            putBest(next, ns, v.c + partialCost[frame], v.f, v.b | bit);
+          }
         }
       }
+
+      if (next.size === 0) {
+        // 全 F 恒合法，故只有“必须局刷”帧可能让可达状态集为空。
+        var segStart = lastForcedF + 1;
+        var msg = '第 ' + frame + ' 帧被要求必须局刷，但自' +
+          (segStart === 0 ? '初始全白' : ('第 ' + (segStart - 1) + ' 帧全刷')) +
+          '起（第 ' + segStart + '–' + frame + ' 帧）始终存在变化瓦片在局刷前残影计数已达上限 ' +
+          o.maxGhost + '，该帧段不存在合法刷新方案';
+        throw PlannerError('INFEASIBLE', msg);
+      }
+
       states = next;
+      if (required === 'F') lastForcedF = frame;
     }
 
     var bestState = -1;
@@ -344,13 +407,13 @@
         bestState = st;
       }
     }
-    if (!best) throw new Error('无合法刷新方案'); // 理论不可达：全 F 恒合法
+    if (!best) throw PlannerError('INFEASIBLE', '无合法刷新方案'); // 理论不可达
 
     var actions = new Array(N);
     for (var a = 0; a < N; a++) actions[a] = (best.b >> (N - 1 - a)) & 1 ? 'P' : 'F';
 
     var sim = simulate(list, actions, o);
-    if (!sim.legal) throw new Error('内部错误：DP 选出了非法方案');
+    if (!sim.legal) throw new Error('内部错误：DP 选出了非法方案（frameModes/费用与 simulate 不一致）');
 
     return {
       version: 1,
@@ -363,6 +426,9 @@
       fullCost: o.fullCost,
       partialBase: o.partialBase,
       maxGhost: o.maxGhost,
+      frameModes: o.frameModes,
+      frameFullCosts: o.frameFullCosts,
+      framePartialBases: o.framePartialBases,
       totalCost: sim.cost,
       fullRefreshCount: sim.fulls,
       partialRefreshCount: N - sim.fulls,
@@ -403,20 +469,24 @@
       for (var i = 0; i < N; i++) {
         var isP = (mask >> i) & 1; // 枚举位：帧 0 在最低位
         var tr = list[i];
+        var required = o.frameModes[i] || 'either';
         if (isP) {
+          if (required === 'F') { legal = false; break; }
           actions[i] = 'P';
           b |= 1 << (N - 1 - i);
+          var pbase = frameAt(o.framePartialBases, i, o.partialBase);
           for (var t = 0; t < T; t++) {
             if (tr.changed[t]) {
               if (counts[t] >= o.maxGhost) { legal = false; break; }
-              cost += o.partialBase + tr.pixels[t];
+              cost += pbase + tr.pixels[t];
               counts[t]++;
             }
           }
         } else {
+          if (required === 'P') { legal = false; break; }
           actions[i] = 'F';
           fulls++;
-          cost += o.fullCost;
+          cost += frameAt(o.frameFullCosts, i, o.fullCost);
           for (var k = 0; k < T; k++) counts[k] = 0;
         }
         if (!legal) break;
@@ -425,7 +495,7 @@
         best = { c: cost, f: fulls, b: b, actions: actions };
       }
     }
-    if (!best) throw new Error('无合法刷新方案');
+    if (!best) throw PlannerError('INFEASIBLE', '无合法刷新方案（存在帧段的刷新方式约束无法满足）');
 
     var sim = simulate(list, best.actions, o);
     return {
@@ -439,6 +509,9 @@
       fullCost: o.fullCost,
       partialBase: o.partialBase,
       maxGhost: o.maxGhost,
+      frameModes: o.frameModes,
+      frameFullCosts: o.frameFullCosts,
+      framePartialBases: o.framePartialBases,
       totalCost: sim.cost,
       fullRefreshCount: sim.fulls,
       partialRefreshCount: N - sim.fulls,
